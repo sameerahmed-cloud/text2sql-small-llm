@@ -1,0 +1,20 @@
+# Python virtual environment and caches
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Secrets: never commit keys
+.env
+
+# Large datasets (live in Google Drive, not GitHub)
+data/raw/
+
+# Model files and training outputs (live on Hugging Face Hub)
+*.safetensors
+*.bin
+*.pt
+*.gguf
+checkpoints/
+outputs/
+wandb/
