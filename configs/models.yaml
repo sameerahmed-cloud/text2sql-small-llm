@@ -1,0 +1,13 @@
+# Model choices for the project. Every script reads model IDs from here.
+main:
+  id: Qwen/Qwen2.5-Coder-1.5B-Instruct
+  license: apache-2.0
+  use: SFT + GRPO training, all main results
+debug:
+  id: Qwen/Qwen2.5-Coder-0.5B-Instruct
+  license: apache-2.0
+  use: fast debugging of training and eval code
+comparison:
+  id: Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
+  license: apache-2.0
+  use: larger model baseline, no fine-tuning (4-bit AWQ in vLLM)
