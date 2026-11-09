@@ -4,6 +4,8 @@ Phase 1.1 — Get the BIRD and Spider datasets.
 Two jobs, two functions:
   download_all()  -> run ONCE. Downloads the official zips and stores them in
                      Google Drive: MyDrive/text2sql/data/raw/zips/
+                     except BIRD train (8.3 GB), which goes to a private
+                     Hugging Face dataset repo: <your-hf-username>/text2sql-raw
   unpack_all()    -> run at the start of EVERY Colab session that needs data.
                      Unzips from Drive onto Colab's local disk (/content/data/raw),
                      which is much faster for SQLite than reading through Drive.
@@ -33,6 +35,10 @@ TMP = Path("/content/tmp_downloads")       # scratch space while downloading
 
 GB = 1024 ** 3
 
+# Private Hugging Face dataset repo for files too big for Drive.
+# Created automatically under your HF username, e.g. "yourname/text2sql-raw".
+HF_RAW_REPO_NAME = "text2sql-raw"
+
 # ---------------------------------------------------------------- sources
 SOURCES = {
     "bird_dev": {
@@ -44,6 +50,7 @@ SOURCES = {
         "url": "https://bird-bench.oss-cn-beijing.aliyuncs.com/train.zip",
         "zip": "bird_train.zip",
         "license": "CC BY-SA 4.0",
+        "store": "hf",  # 8.3 GB: too big for free Drive, so it lives on HF Hub
     },
     "spider": {
         # Official Yale release (Google Drive file id)
@@ -133,9 +140,45 @@ def _unzip(zip_path, out_dir):
         z.extractall(out_dir, members=members)
 
 
-def _unzip_all(zip_path, out_dir):
-    """Extract a zip, then keep extracting any zips found inside (BIRD nests them)."""
+def _hf_token():
+    """Read the HF write token from Colab secrets (set up in step 0.1)."""
+    from google.colab import userdata
+    return userdata.get("HF_TOKEN")
+
+
+def _hf_repo_id(token):
+    """Your private raw-data repo, e.g. 'yourname/text2sql-raw'."""
+    from huggingface_hub import HfApi
+    return f"{HfApi(token=token).whoami()['name']}/{HF_RAW_REPO_NAME}"
+
+
+def _upload_to_hf(local, filename):
+    """Upload a file to your private HF dataset repo (creates the repo if needed)."""
+    from huggingface_hub import HfApi
+    token = _hf_token()
+    api = HfApi(token=token)
+    repo_id = _hf_repo_id(token)
+    api.create_repo(repo_id, repo_type="dataset", private=True, exist_ok=True)
+    print(f"  Uploading to Hugging Face: {repo_id} (private). Large files take a while...")
+    api.upload_file(path_or_fileobj=str(local), path_in_repo=filename,
+                    repo_id=repo_id, repo_type="dataset")
+    return repo_id
+
+
+def _download_from_hf(repo_id, filename, dest_dir):
+    """Download a file from your private HF dataset repo into dest_dir."""
+    from huggingface_hub import hf_hub_download
+    print(f"  Downloading {filename} from {repo_id} ...")
+    return Path(hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset",
+                                local_dir=str(dest_dir), token=_hf_token()))
+
+
+def _unzip_all(zip_path, out_dir, delete_outer=False):
+    """Extract a zip, then keep extracting any zips found inside (BIRD nests them).
+    delete_outer=True removes the outer zip right after extracting, saving disk space."""
     _unzip(zip_path, out_dir)
+    if delete_outer:
+        Path(zip_path).unlink()
     while True:
         inner = list(Path(out_dir).rglob("*.zip"))
         if not inner:
@@ -168,19 +211,23 @@ def download_all(names=("bird_dev", "spider", "bird_train")):
 
     for name in names:
         src = SOURCES[name]
+        on_hf = src.get("store") == "hf"
         final = DRIVE_ZIPS / src["zip"]
-        if final.exists() and name in manifest:
-            print(f"✓ {name}: already in Drive ({final.stat().st_size / GB:.2f} GB), skipping")
+        if name in manifest and (on_hf or final.exists()):
+            where = manifest[name].get("stored_in", "Drive")
+            print(f"✓ {name}: already stored ({where}), skipping")
             continue
 
-        # Check Drive space BEFORE spending time downloading.
-        # (Colab reports Drive free space approximately.)
+        # Check space BEFORE spending time downloading.
+        # Drive files need Drive space; HF files only need temporary Colab disk.
         size = remote_size(src["url"]) if "url" in src else 0
-        free = shutil.disk_usage(DRIVE_ZIPS).free
+        target = TMP if on_hf else DRIVE_ZIPS
+        free = shutil.disk_usage(target).free
+        label = "Colab disk" if on_hf else "Drive"
         print(f"→ {name}: zip size {size / GB:.2f} GB (0.00 = unknown), "
-              f"Drive free ≈ {free / GB:.2f} GB")
+              f"{label} free ≈ {free / GB:.2f} GB")
         if size and size > free - 0.5 * GB:
-            print(f"  ✗ Not enough Drive space for {name}; skipped. Free up space and re-run.")
+            print(f"  ✗ Not enough {label} space for {name}; skipped.")
             continue
 
         local = TMP / src["zip"]
@@ -198,20 +245,27 @@ def download_all(names=("bird_dev", "spider", "bird_train")):
             status = "matches" if digest == src["sha256"] else "DIFFERS from"
             print(f"  SHA-256 {status} the published checksum")
 
-        print(f"  Copying to Drive (big files take a few minutes)...")
-        shutil.copyfile(local, final)
+        n_bytes = local.stat().st_size
+        if on_hf:
+            repo_id = _upload_to_hf(local, src["zip"])
+            stored_in = f"hf:{repo_id}"
+        else:
+            print(f"  Copying to Drive (big files take a few minutes)...")
+            shutil.copyfile(local, final)
+            stored_in = "Drive"
         local.unlink()  # free Colab disk
 
         manifest[name] = {
             "file": src["zip"],
             "source": src.get("url") or f"gdrive:{src['gdrive_id']}",
-            "bytes": final.stat().st_size,
+            "stored_in": stored_in,
+            "bytes": n_bytes,
             "sha256": digest,
             "license": src["license"],
             "downloaded": str(date.today()),
         }
         manifest_path.write_text(json.dumps(manifest, indent=2))  # save after each one
-        print(f"✓ {name}: saved to {final}")
+        print(f"✓ {name}: stored in {stored_in}")
 
     print("\nManifest:\n" + json.dumps(manifest, indent=2))
     return manifest
@@ -223,6 +277,8 @@ def unpack_all(include_bird_train=False, zip_dir=DRIVE_ZIPS, out_dir=LOCAL_RAW):
     On your laptop: unpack_all(zip_dir="data/raw/zips", out_dir="data/raw")."""
     zip_dir, out_dir = Path(zip_dir), Path(out_dir)
     names = ["bird_dev", "spider"] + (["bird_train"] if include_bird_train else [])
+    manifest_path = zip_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     paths = {}
 
     for name in names:
@@ -230,13 +286,20 @@ def unpack_all(include_bird_train=False, zip_dir=DRIVE_ZIPS, out_dir=LOCAL_RAW):
         marker = dest / ".unpacked"  # tells us a previous unpack finished
         if not marker.exists():
             zip_path = zip_dir / SOURCES[name]["zip"]
+            from_hf = False
             if not zip_path.exists():
-                print(f"✗ {name}: {zip_path} not found; run download_all() first. Skipping.")
-                continue
-            print(f"Unpacking {name} ...")
+                stored = manifest.get(name, {}).get("stored_in", "")
+                if not stored.startswith("hf:"):
+                    print(f"✗ {name}: {zip_path} not found; run download_all() first. Skipping.")
+                    continue
+                TMP.mkdir(parents=True, exist_ok=True)
+                zip_path = _download_from_hf(stored[3:], SOURCES[name]["zip"], TMP)
+                from_hf = True
+            print(f"Unpacking {name} (big datasets take several minutes)...")
             shutil.rmtree(dest, ignore_errors=True)  # clear any half-finished attempt
             dest.mkdir(parents=True)
-            _unzip_all(zip_path, dest)
+            # A zip fetched from HF is a temporary copy: delete it once extracted
+            _unzip_all(zip_path, dest, delete_outer=from_hf)
             marker.touch()
 
         layout = LAYOUT[name]
