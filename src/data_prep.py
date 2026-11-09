@@ -22,6 +22,7 @@ Colab use:
 
 import json
 import random
+import sqlite3
 from collections import Counter
 from itertools import combinations
 from pathlib import Path
@@ -60,6 +61,62 @@ def db_path(record, paths):
     """Full path to a record's SQLite file (paths come from unpack_all)."""
     db_dir = Path(paths[record["source"]]["db_dir"])
     return db_dir / record["db_id"] / f"{record['db_id']}.sqlite"
+
+
+# ---------------------------------------------------------------- schema leaks
+SCHEMA_SIMILARITY_LIMIT = 0.5   # remove training DBs at or above this similarity
+SCHEMA_REVIEW_LEVEL = 0.3       # print pairs above this so you can eyeball them
+
+
+def schema_signature(db_file):
+    """The set of 'table.column' names in a database (lowercase).
+    Two databases built from the same source share most of these, even if the
+    database itself has a different name."""
+    try:
+        con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+        tables = [row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        cols = set()
+        for t in tables:
+            safe = t.replace('"', '""')
+            for row in con.execute(f'PRAGMA table_info("{safe}")'):
+                cols.add(f"{t.lower()}.{row[1].lower()}")
+        con.close()
+        return cols
+    except sqlite3.Error as e:
+        print(f"  ⚠ could not read schema of {db_file}: {e}")
+        return set()
+
+
+def jaccard(a, b):
+    """Overlap score from 0 (nothing shared) to 1 (identical)."""
+    return len(a & b) / len(a | b) if (a | b) else 0.0
+
+
+def find_train_leaks(train_pool, test_records, paths):
+    """Find training databases that match a test database by name or schema.
+    Returns {(source, db_id): reason} for databases to remove from training."""
+    def sig(key):
+        return schema_signature(db_path({"source": key[0], "db_id": key[1]}, paths))
+
+    test_keys = sorted({(r["source"], r["db_id"]) for r in test_records})
+    train_keys = sorted({(r["source"], r["db_id"]) for r in train_pool})
+    test_sigs = {k: sig(k) for k in test_keys}
+
+    print(f"Comparing {len(train_keys)} training DBs with {len(test_keys)} test DBs...")
+    leaks = {}
+    for k in train_keys:
+        s = sig(k)
+        for tk, ts in test_sigs.items():
+            score = jaccard(s, ts)
+            same_name = k[1].lower() == tk[1].lower()
+            if same_name or score >= SCHEMA_SIMILARITY_LIMIT:
+                leaks[k] = f"matches test DB {tk[0]}/{tk[1]} (name match: {same_name}, schema similarity {score:.2f})"
+            elif score >= SCHEMA_REVIEW_LEVEL:
+                print(f"  review: {k[0]}/{k[1]} vs {tk[0]}/{tk[1]} similarity {score:.2f} (kept)")
+    for k, reason in leaks.items():
+        print(f"  removed from training: {k[0]}/{k[1]} — {reason}")
+    return leaks
 
 
 # ---------------------------------------------------------------- splitting
@@ -120,6 +177,11 @@ def make_splits(paths, out_dir=DRIVE_PROCESSED):
     if not any(r["source"] == "bird_train" for r in train_pool):
         print("⚠ BIRD train not found: splitting Spider train only (re-run once BIRD train is unpacked)")
 
+    # 2b. Remove training databases that duplicate a test database (by name or schema).
+    #     The test sets are fixed benchmarks, so training is what gives way.
+    leaks = find_train_leaks(train_pool, test_bird + test_spider, paths)
+    train_pool = [r for r in train_pool if (r["source"], r["db_id"]) not in leaks]
+
     # 3. Validation: hold out whole databases, ~10% from each source separately,
     #    so validation reflects both BIRD-style and Spider-style questions
     val_keys = set()
@@ -148,6 +210,7 @@ def make_splits(paths, out_dir=DRIVE_PROCESSED):
             "by_source": dict(Counter(r["source"] for r in recs)),
         }
     summary["val_databases"] = sorted(f"{s}/{db}" for s, db in val_keys)
+    summary["removed_from_train"] = {f"{s}/{db}": why for (s, db), why in sorted(leaks.items())}
     (out_dir / "split_summary.json").write_text(json.dumps(summary, indent=2))
 
     print(f"\nSaved to {out_dir}")
