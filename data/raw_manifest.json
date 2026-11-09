@@ -1,0 +1,30 @@
+{
+  "bird_dev": {
+    "file": "bird_dev.zip",
+    "source": "https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip",
+    "bytes": 346207293,
+    "sha256": "cdd6d19faeb45a23970b98d3ef6c40a87987c95459c2cf12076897a60cf5a630",
+    "license": "CC BY-SA 4.0",
+    "downloaded": "2026-11-09"
+  },
+  "spider": {
+    "file": "spider_data.zip",
+    "source": "gdrive:1403EGqzIDoHMdQF4c9Bkyl7dZLZ5Wt6J",
+    "bytes": 205800266,
+    "sha256": "00636695dabed6b5f4b8328a16b13e069a2f16591d5efcce57660669c85b121b",
+    "license": "CC BY-SA 4.0",
+    "downloaded": "2026-11-09"
+  }
+}
+{'bird_dev': {'file': 'bird_dev.zip',
+  'source': 'https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip',
+  'bytes': 346207293,
+  'sha256': 'cdd6d19faeb45a23970b98d3ef6c40a87987c95459c2cf12076897a60cf5a630',
+  'license': 'CC BY-SA 4.0',
+  'downloaded': '2026-11-09'},
+ 'spider': {'file': 'spider_data.zip',
+  'source': 'gdrive:1403EGqzIDoHMdQF4c9Bkyl7dZLZ5Wt6J',
+  'bytes': 205800266,
+  'sha256': '00636695dabed6b5f4b8328a16b13e069a2f16591d5efcce57660669c85b121b',
+  'license': 'CC BY-SA 4.0',
+  'downloaded': '2026-11-09'}}
