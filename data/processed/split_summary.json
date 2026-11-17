@@ -1,0 +1,68 @@
+{
+  "seed": 42,
+  "val_fraction": 0.1,
+  "splits": {
+    "train": {
+      "questions": 14601,
+      "databases": 181,
+      "by_source": {
+        "spider": 6205,
+        "bird_train": 8396
+      }
+    },
+    "val": {
+      "questions": 1634,
+      "databases": 25,
+      "by_source": {
+        "spider": 701,
+        "bird_train": 933
+      }
+    },
+    "test_bird": {
+      "questions": 1534,
+      "databases": 11,
+      "by_source": {
+        "bird_dev": 1534
+      }
+    },
+    "test_spider": {
+      "questions": 1034,
+      "databases": 20,
+      "by_source": {
+        "spider": 1034
+      }
+    }
+  },
+  "val_databases": [
+    "bird_train/books",
+    "bird_train/computer_student",
+    "bird_train/hockey",
+    "bird_train/language_corpus",
+    "bird_train/retails",
+    "bird_train/software_company",
+    "spider/aircraft",
+    "spider/body_builder",
+    "spider/climbing",
+    "spider/coffee_shop",
+    "spider/company_employee",
+    "spider/csu_1",
+    "spider/gymnast",
+    "spider/icfp_1",
+    "spider/local_govt_in_alabama",
+    "spider/musical",
+    "spider/pilot_record",
+    "spider/program_share",
+    "spider/protein_institute",
+    "spider/sakila_1",
+    "spider/shop_membership",
+    "spider/tracking_software_problems",
+    "spider/twitter_1",
+    "spider/wedding",
+    "spider/workshop_paper"
+  ],
+  "removed_from_train": {
+    "bird_train/world": "matches test DB spider/world_1 (name match: False, similarity 1.00, containment 1.00)",
+    "spider/formula_1": "matches test DB bird_dev/formula_1 (name match: True, similarity 1.00, containment 1.00)",
+    "spider/soccer_1": "matches test DB bird_dev/european_football_2 (name match: False, similarity 0.42, containment 1.00)"
+  }
+}
