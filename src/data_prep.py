@@ -65,6 +65,7 @@ def db_path(record, paths):
 
 # ---------------------------------------------------------------- schema leaks
 SCHEMA_SIMILARITY_LIMIT = 0.5   # remove training DBs at or above this similarity
+SCHEMA_CONTAINMENT_LIMIT = 0.8  # remove if one schema is mostly inside the other
 SCHEMA_REVIEW_LEVEL = 0.3       # print pairs above this so you can eyeball them
 
 
@@ -93,6 +94,13 @@ def jaccard(a, b):
     return len(a & b) / len(a | b) if (a | b) else 0.0
 
 
+def containment(a, b):
+    """Share of the SMALLER schema found in the bigger one (0 to 1).
+    Catches cut-down copies: a database with 6 of another's 7 tables scores
+    high here even if the 7th table is huge and drags Jaccard down."""
+    return len(a & b) / min(len(a), len(b)) if (a and b) else 0.0
+
+
 def find_train_leaks(train_pool, test_records, paths):
     """Find training databases that match a test database by name or schema.
     Returns {(source, db_id): reason} for databases to remove from training."""
@@ -109,11 +117,14 @@ def find_train_leaks(train_pool, test_records, paths):
         s = sig(k)
         for tk, ts in test_sigs.items():
             score = jaccard(s, ts)
+            inside = containment(s, ts)
             same_name = k[1].lower() == tk[1].lower()
-            if same_name or score >= SCHEMA_SIMILARITY_LIMIT:
-                leaks[k] = f"matches test DB {tk[0]}/{tk[1]} (name match: {same_name}, schema similarity {score:.2f})"
-            elif score >= SCHEMA_REVIEW_LEVEL:
-                print(f"  review: {k[0]}/{k[1]} vs {tk[0]}/{tk[1]} similarity {score:.2f} (kept)")
+            scores = f"similarity {score:.2f}, containment {inside:.2f}"
+            if same_name or score >= SCHEMA_SIMILARITY_LIMIT or inside >= SCHEMA_CONTAINMENT_LIMIT:
+                leaks[k] = f"matches test DB {tk[0]}/{tk[1]} (name match: {same_name}, {scores})"
+                break
+            if score >= SCHEMA_REVIEW_LEVEL:
+                print(f"  review: {k[0]}/{k[1]} vs {tk[0]}/{tk[1]} {scores} (kept)")
     for k, reason in leaks.items():
         print(f"  removed from training: {k[0]}/{k[1]} — {reason}")
     return leaks
