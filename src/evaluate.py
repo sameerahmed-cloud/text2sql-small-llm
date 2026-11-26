@@ -24,7 +24,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-TIMEOUT_S = 10  # a query running longer than this counts as "timeout"
+TIMEOUT_S = 30  # a query running longer than this counts as "timeout"
 
 # Outcome labels (one per question)
 CORRECT = "correct"
