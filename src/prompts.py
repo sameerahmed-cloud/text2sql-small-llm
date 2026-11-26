@@ -18,6 +18,12 @@ Main functions:
   measure_prompt_lengths(records, paths, tokenizer)
                                               token-length statistics for a set of questions
 
+Few-shot (Phase 1.5b): pass examples=... to build_messages / build_prompt.
+  pick_fewshot_examples(train_records, paths) chooses 3 solved PRACTICE questions by a
+  fixed rule; save_fewshot_examples / load_fewshot_examples store them (with their
+  sheets already built) so the GPU session doesn't need the practice databases.
+  Without examples, the prompt is exactly the zero-shot prompt above.
+
 Colab use:
     from transformers import AutoTokenizer
     from src.prompts import build_prompt
@@ -25,6 +31,8 @@ Colab use:
     text = build_prompt(db_file, question, evidence, tok)
 """
 
+import json
+import random
 import sqlite3
 import statistics
 from collections import defaultdict
@@ -123,32 +131,105 @@ def get_schema(db_path):
 
 
 # ---------------------------------------------------------------- prompt
-def build_messages(db_path, question, evidence=""):
-    """The prompt as chat messages (system + user).
-
-    Phase 2.1 adds the gold SQL as a third, 'assistant' message for training.
-    """
+def user_message(db_path, question, evidence=""):
+    """The 'user' text for one question: schema, optional hint, question, instruction."""
     parts = ["Database schema:", get_schema(str(db_path)), ""]
     if evidence:  # BIRD's hint, e.g. "eligible free rate = Free Meal Count / Enrollment"
         parts += [f"Hint: {evidence}", ""]
     parts += [f"Question: {question}", "", INSTRUCTION]
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": "\n".join(parts)},
-    ]
+    return "\n".join(parts)
 
 
-def build_prompt(db_path, question, evidence, tokenizer):
+def format_answer(sql):
+    """How a correct answer is written: the SQL inside a ```sql block.
+    Used for few-shot examples now and for training answers in Phase 2.1."""
+    return f"```sql\n{sql.strip()}\n```"
+
+
+def build_messages(db_path, question, evidence="", examples=None):
+    """The prompt as chat messages.
+
+    Zero-shot (examples=None): system + user.
+    Few-shot: system, then for each example a user message + its correct
+    assistant answer, then the real user message last.
+    Phase 2.1 adds the gold SQL as a final 'assistant' message for training.
+    """
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for ex in examples or []:
+        messages.append({"role": "user", "content": ex["user"]})
+        messages.append({"role": "assistant", "content": ex["assistant"]})
+    messages.append({"role": "user", "content": user_message(db_path, question, evidence)})
+    return messages
+
+
+def build_prompt(db_path, question, evidence, tokenizer, examples=None):
     """The exact text the model reads, in the model's own chat format.
 
     add_generation_prompt=True ends the text with the 'assistant' header, so
     the model's next tokens are its answer.
     """
     return tokenizer.apply_chat_template(
-        build_messages(db_path, question, evidence),
+        build_messages(db_path, question, evidence, examples),
         tokenize=False,
         add_generation_prompt=True,
     )
+
+
+# ---------------------------------------------------------------- few-shot
+# Fixed rule for choosing the 3 examples: one slot per SQL pattern, each from a
+# different PRACTICE database (never an exam database), always the database with
+# the smallest schema so the extra sheets stay short. Chosen by rule, not by hand,
+# so the examples aren't tuned to the exam's mistakes.
+FEWSHOT_SLOTS = [
+    ("BIRD question with a hint and a JOIN",
+     lambda r: r["source"] == "bird_train" and r["evidence"] and " JOIN " in r["gold_sql"].upper()),
+    ("Spider question with GROUP BY",
+     lambda r: r["source"] == "spider" and "GROUP BY" in r["gold_sql"].upper()),
+    ("Spider question with a JOIN",
+     lambda r: r["source"] == "spider" and " JOIN " in r["gold_sql"].upper()
+     and "GROUP BY" not in r["gold_sql"].upper()),
+]
+
+
+def pick_fewshot_examples(train_records, paths, seed=42):
+    """Choose one practice question per slot in FEWSHOT_SLOTS and build its sheet."""
+    from src.data_prep import db_path as record_db_path
+
+    rng = random.Random(seed)
+    schema_size = {}  # characters of schema text per database
+    used, chosen = set(), []
+    for why, matches in FEWSHOT_SLOTS:
+        cands = [r for r in train_records if matches(r) and (r["source"], r["db_id"]) not in used]
+        if not cands:
+            raise ValueError(f"No practice question fits the slot: {why}")
+        for r in cands:
+            key = (r["source"], r["db_id"])
+            if key not in schema_size:
+                schema_size[key] = len(get_schema(str(record_db_path(r, paths))))
+        # the smallest database for this slot (db_id breaks ties, so the choice is fixed)
+        best = min({(r["source"], r["db_id"]) for r in cands},
+                   key=lambda k: (schema_size[k], k[1]))
+        pool = sorted((r for r in cands if (r["source"], r["db_id"]) == best), key=lambda r: r["id"])
+        r = rng.choice(pool)
+        used.add(best)
+        chosen.append({
+            "why": why, "id": r["id"], "source": r["source"], "db_id": r["db_id"],
+            "question": r["question"], "evidence": r["evidence"], "gold_sql": r["gold_sql"],
+            "user": user_message(record_db_path(r, paths), r["question"], r["evidence"]),
+            "assistant": format_answer(r["gold_sql"]),
+        })
+    return chosen
+
+
+def save_fewshot_examples(examples, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(examples, f, indent=1, ensure_ascii=False)
+    print(f"Saved {len(examples)} examples to {path}")
+
+
+def load_fewshot_examples(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 # ---------------------------------------------------------------- lengths

@@ -26,21 +26,33 @@ def load_model(model_id, max_model_len=MAX_MODEL_LEN):
     seed=42 so a re-run gives the same answers.
     """
     from vllm import LLM
-    return LLM(model=model_id, dtype="half", max_model_len=max_model_len, seed=42)
+    llm = LLM(model=model_id, dtype="half", max_model_len=max_model_len, seed=42)
+    llm.t2s_max_len = max_model_len  # remembered so generate_answers can check prompt lengths
+    return llm
 
 
-def generate_answers(llm, records, paths, out_file=None, max_new_tokens=MAX_NEW_TOKENS):
+def generate_answers(llm, records, paths, out_file=None, max_new_tokens=MAX_NEW_TOKENS, examples=None):
     """Build each question's prompt, let the model answer all of them, return {id: answer text}.
 
     temperature=0 means the model always picks its most likely next token
     ("greedy"), so the same prompt always gives the same answer.
+    examples: few-shot examples from prompts.load_fewshot_examples (None = zero-shot).
     """
     from vllm import SamplingParams
     from src.data_prep import db_path
     from src.prompts import build_prompt
 
     tok = llm.get_tokenizer()  # the same tokenizer as in step 1.3
-    prompts = [build_prompt(db_path(r, paths), r["question"], r["evidence"], tok) for r in records]
+    prompts = [build_prompt(db_path(r, paths), r["question"], r["evidence"], tok, examples)
+               for r in records]
+
+    # Check lengths BEFORE generating: one prompt that is too long would stop the whole run
+    longest = max(len(tok(p)["input_ids"]) for p in prompts)
+    limit = getattr(llm, "t2s_max_len", MAX_MODEL_LEN)
+    print(f"Longest prompt: {longest} tokens (+{max_new_tokens} for the answer; limit {limit})")
+    if longest + max_new_tokens > limit:
+        raise ValueError(f"Prompts too long: reload with load_model(..., max_model_len="
+                         f"{longest + max_new_tokens}) or more")
 
     start = time.time()
     # vLLM answers many prompts at the same time; outputs come back in the same order
