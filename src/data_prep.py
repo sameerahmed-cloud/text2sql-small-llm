@@ -228,3 +228,84 @@ def make_splits(paths, out_dir=DRIVE_PROCESSED):
     for name, s in summary["splits"].items():
         print(f"  {name:12s} {s['questions']:6d} questions  {s['databases']:4d} databases  {s['by_source']}")
     return summary
+
+# ---------------------------------------------------------------- 2.1 chat format
+# Databases never used for training. works_cycles' schema alone is ~22,000 tokens
+# (decided in 1.3): it can't fit any training length we could afford on a T4.
+TRAIN_EXCLUDE_DBS = {"works_cycles"}
+
+
+def read_jsonl(path):
+    """Read a JSONL file back into a list of dicts."""
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f]
+
+
+def to_chat_example(record, paths):
+    """One question -> one training conversation.
+
+    The system + user messages come from build_messages(), the SAME function the
+    exam uses, so the model trains on exactly the prompt it will see at test time.
+    The gold SQL becomes the assistant message, written the way we ask the model
+    to answer (inside a ```sql block). Zero-shot format: no few-shot examples.
+    """
+    from src.prompts import build_messages, format_answer
+
+    messages = build_messages(db_path(record, paths), record["question"], record["evidence"])
+    messages.append({"role": "assistant", "content": format_answer(record["gold_sql"])})
+    # id/source/db_id ride along so 2.2 (filtering) and 2.4 (leak check) can use them.
+    # The trainer only reads "messages".
+    return {"id": record["id"], "source": record["source"], "db_id": record["db_id"],
+            "messages": messages}
+
+
+def make_chat_files(paths, splits=("train", "val"), in_dir=DRIVE_PROCESSED, out_dir=DRIVE_PROCESSED):
+    """Write sft_<split>.jsonl (chat format) for each split and return counts.
+
+    Reads the split files from 1.2 (train.jsonl, val.jsonl) and never overwrites them.
+    Needs BIRD train unpacked: unpack_all(include_bird_train=True).
+    """
+    in_dir, out_dir = Path(in_dir), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary = {}
+    for name in splits:
+        records = read_jsonl(in_dir / f"{name}.jsonl")
+        kept = [r for r in records if r["db_id"] not in TRAIN_EXCLUDE_DBS]
+        excluded = len(records) - len(kept)
+
+        chats = []
+        for i, r in enumerate(kept, 1):
+            chats.append(to_chat_example(r, paths))
+            if i % 2000 == 0:
+                print(f"  {name}: formatted {i}/{len(kept)}")
+
+        out_file = out_dir / f"sft_{name}.jsonl"
+        write_jsonl(chats, out_file)
+        size_mb = out_file.stat().st_size / 1e6
+        summary[name] = {"questions_in": len(records), "excluded_db": excluded,
+                         "examples_out": len(chats),
+                         "by_source": dict(Counter(c["source"] for c in chats)),
+                         "file_mb": round(size_mb, 1)}
+        print(f"✓ {name}: {len(chats)} examples ({excluded} excluded: {sorted(TRAIN_EXCLUDE_DBS)}) "
+              f"-> {out_file} ({size_mb:.0f} MB)")
+    return summary
+
+
+def check_chat_file(path, tokenizer, n=5, seed=SEED):
+    """Spot-check a chat file with the model's own chat template.
+
+    The key test: the full training text must START WITH the exact text the model
+    reads at answer time (build_prompt's output). If it does, training and testing
+    see identical prompts, and the only new part is the SQL answer.
+    """
+    rows = read_jsonl(path)
+    for row in random.Random(seed).sample(rows, min(n, len(rows))):
+        msgs = row["messages"]
+        assert [m["role"] for m in msgs] == ["system", "user", "assistant"], row["id"]
+        assert msgs[-1]["content"].startswith("```sql\n") and msgs[-1]["content"].endswith("\n```"), row["id"]
+        full = tokenizer.apply_chat_template(msgs, tokenize=False)
+        prompt = tokenizer.apply_chat_template(msgs[:-1], tokenize=False, add_generation_prompt=True)
+        assert full.startswith(prompt), f"{row['id']}: training text doesn't start with the test prompt"
+    print(f"✓ {path}: {len(rows)} rows; {min(n, len(rows))} spot-checked, training text = test prompt + answer")
+    print("\nEnd of one example (what the model learns to produce comes after 'assistant'):")
+    print("..." + full[-400:])
