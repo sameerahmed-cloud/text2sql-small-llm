@@ -235,7 +235,7 @@ def make_splits(paths, out_dir=DRIVE_PROCESSED):
 # ---------------------------------------------------------------- 2.1 chat format
 # Databases never used for training. works_cycles' schema alone is ~22,000 tokens
 # (decided in 1.3): it can't fit any training length we could afford on a T4.
-TRAIN_EXCLUDE_DBS = {"works_cycles"}
+TRAIN_EXCLUDE_DBS = {"works_cycles", "retail_world"}  # retail_world: its gold SQL uses tables/columns (Order Details, Territories, CompanyName...) its DB file doesn't have; 330 of 373 fail
 
 
 def read_jsonl(path):
