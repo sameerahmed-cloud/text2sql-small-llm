@@ -10,8 +10,10 @@ Phase 1.2 — Split by database.
   Every database appears in exactly ONE split, so the model is always tested on
   databases it has never seen.
 
-Later phases (2.1 chat formatting, 2.2 filtering, 2.4 leakage check) will add
-functions to this same file.
+Phase 2.1/2.2 — Training files.
+  make_chat_files(paths) writes sft_train.jsonl / sft_val.jsonl: chat-format
+  conversations whose gold SQL has been run and works (check_gold), with tidy spacing
+  (tidy_sql, verified by verify_tidy). 2.4 (leakage check) will add functions here too.
 
 Colab use:
     from src.get_data import unpack_all
@@ -22,6 +24,7 @@ Colab use:
 
 import json
 import random
+import re
 import sqlite3
 from collections import Counter
 from itertools import combinations
@@ -259,11 +262,18 @@ def to_chat_example(record, paths):
             "messages": messages}
 
 
-def make_chat_files(paths, splits=("train", "val"), in_dir=DRIVE_PROCESSED, out_dir=DRIVE_PROCESSED):
+def make_chat_files(paths, splits=("train", "val"), in_dir=DRIVE_PROCESSED, out_dir=DRIVE_PROCESSED,
+                    check_gold_sql=True, tidy=True):
     """Write sft_<split>.jsonl (chat format) for each split and return counts.
 
+    Steps per split:
+      1. drop databases in TRAIN_EXCLUDE_DBS                    (2.1)
+      2. run every gold query; drop the ones that fail        (2.2, check_gold)
+      3. tidy the spacing of the gold SQL that's kept           (2.2, tidy_sql)
+      4. turn each question into a chat conversation          (2.1, to_chat_example)
     Reads the split files from 1.2 (train.jsonl, val.jsonl) and never overwrites them.
     Needs BIRD train unpacked: unpack_all(include_bird_train=True).
+    Also saves sft_summary.json (counts + every dropped question) next to the files.
     """
     in_dir, out_dir = Path(in_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -272,6 +282,24 @@ def make_chat_files(paths, splits=("train", "val"), in_dir=DRIVE_PROCESSED, out_
         records = read_jsonl(in_dir / f"{name}.jsonl")
         kept = [r for r in records if r["db_id"] not in TRAIN_EXCLUDE_DBS]
         excluded = len(records) - len(kept)
+
+        dropped, empty = [], 0
+        if check_gold_sql:
+            checks = check_gold(kept, paths, out_dir / f"gold_check_{name}.jsonl")
+            dropped = [{"id": r["id"], "db_id": r["db_id"], **checks[r["id"]]}
+                       for r in kept if not checks[r["id"]]["ok"]]
+            empty = sum(checks[r["id"]]["ok"] and checks[r["id"]]["rows"] == 0 for r in kept)
+            kept = [r for r in kept if checks[r["id"]]["ok"]]
+
+        n_tidied = 0
+        if tidy:
+            verify_tidy(kept, paths)   # stops everything if tidying ever changes a result
+            tidied = []
+            for r in kept:
+                t = tidy_sql(r["gold_sql"])
+                n_tidied += t != r["gold_sql"]
+                tidied.append({**r, "gold_sql": t})
+            kept = tidied
 
         chats = []
         for i, r in enumerate(kept, 1):
@@ -283,11 +311,19 @@ def make_chat_files(paths, splits=("train", "val"), in_dir=DRIVE_PROCESSED, out_
         write_jsonl(chats, out_file)
         size_mb = out_file.stat().st_size / 1e6
         summary[name] = {"questions_in": len(records), "excluded_db": excluded,
+                         "gold_failed": len(dropped),
+                         "gold_failed_by_outcome": dict(Counter(d["outcome"] for d in dropped)),
+                         "gold_empty_result_kept": empty, "gold_tidied": n_tidied,
                          "examples_out": len(chats),
                          "by_source": dict(Counter(c["source"] for c in chats)),
-                         "file_mb": round(size_mb, 1)}
-        print(f"✓ {name}: {len(chats)} examples ({excluded} excluded: {sorted(TRAIN_EXCLUDE_DBS)}) "
-              f"-> {out_file} ({size_mb:.0f} MB)")
+                         "file_mb": round(size_mb, 1),
+                         "dropped": dropped}
+        print(f"✓ {name}: {len(chats)} examples | excluded {excluded} ({sorted(TRAIN_EXCLUDE_DBS)}) | "
+              f"gold failed {len(dropped)} {summary[name]['gold_failed_by_outcome']} | "
+              f"empty result (kept) {empty} | tidied {n_tidied} -> {out_file} ({size_mb:.0f} MB)")
+
+    (out_dir / "sft_summary.json").write_text(json.dumps(summary, indent=1, ensure_ascii=False))
+    print(f"Saved {out_dir / 'sft_summary.json'}")
     return summary
 
 
@@ -309,3 +345,81 @@ def check_chat_file(path, tokenizer, n=5, seed=SEED):
     print(f"✓ {path}: {len(rows)} rows; {min(n, len(rows))} spot-checked, training text = test prompt + answer")
     print("\nEnd of one example (what the model learns to produce comes after 'assistant'):")
     print("..." + full[-400:])
+
+
+# ---------------------------------------------------------------- 2.2 keep only working examples
+def check_gold(records, paths, cache_file, timeout_s=None):
+    """Run every record's gold SQL once with the exam's own run_sql (read-only, same
+    30 s limit). Returns {id: {"ok", "outcome", "error", "rows", "seconds"}}.
+
+    Results are appended to cache_file (on Drive) one line at a time, so if Colab
+    disconnects, re-running skips everything already checked and carries on.
+    """
+    import time
+    from src.evaluate import run_sql, TIMEOUT_S
+    timeout_s = timeout_s or TIMEOUT_S
+
+    cache_file = Path(cache_file)
+    done = {}
+    if cache_file.exists():
+        done = {row["id"]: row for row in read_jsonl(cache_file)}
+    todo = [r for r in records if r["id"] not in done]
+    print(f"Gold check: {len(done)} already in {cache_file.name}, {len(todo)} to run")
+
+    start = time.monotonic()
+    with open(cache_file, "a", encoding="utf-8") as f:
+        for i, r in enumerate(todo, 1):
+            t0 = time.monotonic()
+            rows, label, msg = run_sql(db_path(r, paths), r["gold_sql"], timeout_s)
+            row = {"id": r["id"], "ok": label is None, "outcome": label or "ok", "error": msg,
+                   "rows": len(rows) if rows is not None else None,
+                   "seconds": round(time.monotonic() - t0, 2)}
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()                 # written to Drive now, not at the end
+            done[r["id"]] = row
+            if i % 500 == 0:
+                print(f"  checked {i}/{len(todo)} ({time.monotonic() - start:.0f} s)")
+    return {r["id"]: done[r["id"]] for r in records}
+
+
+# Quoted parts of SQL that must never be touched: 'text', "names", `names`, [names].
+# '' and "" inside are SQL's way of writing a quote character, so they stay part of the match.
+_QUOTED = re.compile(r"""('(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\])""")
+
+
+def tidy_sql(sql):
+    """Squash runs of spaces/newlines/tabs into one space, OUTSIDE quoted parts,
+    and drop a trailing ';'. Example: 'a  =  "Solveig"' -> 'a = "Solveig"'.
+
+    Safe because SQL ignores how much whitespace sits between words; only text
+    inside quotes is meaningful, and that is left exactly as it was. Queries with
+    comments (-- or /* */) are returned unchanged: joining lines could swallow code
+    into a '--' comment.
+    """
+    parts = _QUOTED.split(sql)         # even positions: plain SQL, odd: quoted
+    plain = parts[0::2]
+    if any("--" in p or "/*" in p for p in plain):
+        return sql
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"\s+", " ", parts[i])
+    return "".join(parts).strip().rstrip(";").strip()
+
+
+def verify_tidy(records, paths, n=200, seed=SEED, timeout_s=None):
+    """Proof on a random sample: tidied gold SQL must return exactly the same rows
+    as the original. Pass records that already passed check_gold."""
+    from src.evaluate import run_sql, same_result, TIMEOUT_S
+    timeout_s = timeout_s or TIMEOUT_S
+
+    changed = [r for r in records if tidy_sql(r["gold_sql"]) != r["gold_sql"]]
+    sample = random.Random(seed).sample(changed, min(n, len(changed)))
+    bad = []
+    for r in sample:
+        a, la, _ = run_sql(db_path(r, paths), r["gold_sql"], timeout_s)
+        b, lb, _ = run_sql(db_path(r, paths), tidy_sql(r["gold_sql"]), timeout_s)
+        if la or lb or not same_result(a, b):
+            bad.append(r["id"])
+    print(f"Tidy check: {len(changed)} of {len(records)} queries change; "
+          f"{len(sample) - len(bad)}/{len(sample)} sampled give identical results")
+    if bad:
+        raise AssertionError(f"tidy_sql changed the result of: {bad[:10]}")
